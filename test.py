@@ -20,7 +20,7 @@ from metrics import iou_score, indicators
 from utils import AverageMeter
 from albumentations import RandomRotate90,Resize
 import time
-from model import AttmNet
+from model import BMFSegNet
 from PIL import Image
 from dataset import get_train_val_test_loader_from_train, get_train_val_test_indices
 
@@ -59,7 +59,7 @@ def main():
 
     cudnn.benchmark = True
 
-    model = AttmNet(in_chans=3,out_chans=1,depths=[2,2,2,2],feat_size=[48, 96, 192, 384])
+    model = BMFSegNet(in_chans=3,out_chans=1,depths=[2,2,2,2],feat_size=[48, 96, 192, 384])
     model = model.cuda()
 
     dataset_name = config['dataset']
