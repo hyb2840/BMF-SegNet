@@ -23,7 +23,7 @@ from torch.optim import lr_scheduler
 from tqdm import tqdm
 from albumentations import RandomRotate90, Resize
 
-from model import AttmNet
+from model import BMFSegNet
 import losses
 from dataset import Dataset
 
@@ -63,7 +63,7 @@ def parse_args():
                         help='')
     
     # model
-    parser.add_argument('--arch', '-a', metavar='ARCH', default='AttmNet')
+    parser.add_argument('--arch', '-a', metavar='ARCH', default='BMFSegNet')
     
     parser.add_argument('--deep_supervision', default=False, type=str2bool)
     parser.add_argument('--input_channels', default=3, type=int,
@@ -268,7 +268,7 @@ def main():
 
     # create model
    
-    model = AttmNet(in_chans=3,out_chans=1,depths=[2,2,2,2],feat_size=[48, 96, 192, 384])
+    model = BMFSegNet(in_chans=3,out_chans=1,depths=[2,2,2,2],feat_size=[48, 96, 192, 384])
     model = model.cuda()
 
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
