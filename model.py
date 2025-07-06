@@ -381,7 +381,7 @@ class UNetUpBlockWithInterpolation(nn.Module):
         x = self.conv(x)
         return x
         
-class FDImamba(nn.Module):
+class BMFSegNet(nn.Module):
     def __init__(self, 
                  in_chans=3,
                  out_chans=1,
