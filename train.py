@@ -129,9 +129,66 @@ def parse_args():
 
     return config
 
-def train(config, train_loader, model, criterion, optimizer):
+class BoundaryLoss(nn.Module):
+    def __init__(self, inner_expand=3, outer_expand=3, cosine_weight=1.0, visualize=False):
+        super().__init__()
+        self.inner_expand = inner_expand
+        self.outer_expand = outer_expand
+        self.cosine_weight = cosine_weight
+    
+    def extract_boundary(self, mask):
+        sobel_x = cv2.Sobel(mask, cv2.CV_64F, 1, 0, ksize=7)
+        sobel_y = cv2.Sobel(mask, cv2.CV_64F, 0, 1, ksize=7)
+        edge = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
+        edge = (edge > 0).astype(np.uint8)
+        return edge
+
+    def forward(self, pred, target):
+        pred = torch.sigmoid(pred)
+        target_np = target.cpu().numpy().astype(np.uint8)
+
+        boundary_loss = 0
+        cosine_loss = 0
+        batch_size = target.shape[0]
+
+        for i in range(batch_size):
+            gt_mask = target_np[i, 0]
+            pred_mask = (pred[i, 0].detach().cpu().numpy() > 0.5).astype(np.uint8)
+
+            gt_edge = self.extract_boundary(gt_mask)
+            pred_edge = self.extract_boundary(pred_mask)
+
+            gt_inner = binary_dilation(gt_edge, iterations=self.inner_expand) & (gt_mask == 1)
+            gt_outer = binary_dilation(gt_edge, iterations=self.outer_expand) & (gt_mask == 0)
+
+            pred_inner = binary_dilation(pred_edge, iterations=self.inner_expand) & (pred_mask == 1)
+            pred_outer = binary_dilation(pred_edge, iterations=self.outer_expand) & (pred_mask == 0)
+
+            gt_inner_tensor = torch.tensor(gt_inner, dtype=torch.float32, device=pred.device)
+            gt_outer_tensor = torch.tensor(gt_outer, dtype=torch.float32, device=pred.device)
+            pred_inner_tensor = torch.tensor(pred_inner, dtype=torch.float32, device=pred.device)
+            pred_outer_tensor = torch.tensor(pred_outer, dtype=torch.float32, device=pred.device)
+
+            inner_loss_gt = F.mse_loss(pred[i, 0] * gt_inner_tensor, torch.ones_like(pred[i, 0]) * gt_inner_tensor)
+            outer_loss_gt = F.mse_loss(pred[i, 0] * gt_outer_tensor, torch.zeros_like(pred[i, 0]) * gt_outer_tensor)
+
+            target_tensor = torch.tensor(gt_mask, dtype=torch.float32, device=pred.device)
+            inner_loss_pred = F.mse_loss(target_tensor * pred_inner_tensor, torch.ones_like(target_tensor) * pred_inner_tensor)
+            outer_loss_pred = F.mse_loss(target_tensor * pred_outer_tensor, torch.zeros_like(target_tensor) * pred_outer_tensor)
+
+            boundary_loss += inner_loss_gt + outer_loss_gt 
+
+            pred_flat = pred[i, 0].view(-1)
+            target_flat = target_tensor.view(-1)
+            cosine_loss += 1 - F.cosine_similarity(pred_flat, target_flat, dim=0).mean()
+
+        final_loss = (boundary_loss / batch_size) + self.cosine_weight * (cosine_loss / batch_size)
+        return final_loss
+
+def train(config, train_loader, model, criterion, boundary_loss, optimizer):
     avg_meters = {'loss': AverageMeter(),
-                  'iou': AverageMeter()}
+                  'iou': AverageMeter(),
+                  'boundary_loss': AverageMeter()} 
 
     model.train()
 
@@ -144,43 +201,55 @@ def train(config, train_loader, model, criterion, optimizer):
         if config['deep_supervision']:
             outputs = model(input)
             loss = 0
+            boundary_loss_value = 0
             for output in outputs:
                 loss += criterion(output, target)
-            loss /= len(outputs)
+                boundary_loss_value += boundary_loss(output, target) 
 
+            loss /= len(outputs)
+            boundary_loss_value /= len(outputs)
+
+            total_loss = loss + boundary_loss_value 
             iou, dice, _ = iou_score(outputs[-1], target)
-            iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(outputs[-1], target)
-                       
+
         else:
             output = model(input)
             loss = criterion(output, target)
+            boundary_loss_value = boundary_loss(output, target) 
+
+            total_loss = loss + boundary_loss_value  
+            #total_loss = loss
             iou, dice, _ = iou_score(output, target)
-            iou_, dice_, hd_, hd95_, recall_, specificity_, precision_ = indicators(output, target)
-           
+
         # compute gradient and do optimizing step
         optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         optimizer.step()
 
         avg_meters['loss'].update(loss.item(), input.size(0))
+        avg_meters['boundary_loss'].update(boundary_loss_value.item(), input.size(0))
         avg_meters['iou'].update(iou, input.size(0))
 
         postfix = OrderedDict([
             ('loss', avg_meters['loss'].avg),
+            ('boundary_loss', avg_meters['boundary_loss'].avg),
             ('iou', avg_meters['iou'].avg),
         ])
         pbar.set_postfix(postfix)
         pbar.update(1)
     pbar.close()
 
-    return OrderedDict([('loss', avg_meters['loss'].avg),
-                        ('iou', avg_meters['iou'].avg)])
+    return OrderedDict([
+        ('loss', avg_meters['loss'].avg),
+        ('boundary_loss', avg_meters['boundary_loss'].avg),
+        ('iou', avg_meters['iou'].avg),
+    ])
 
-
-def validate(config, val_loader, model, criterion):
+def validate(config, val_loader, model, criterion, boundary_loss):
     avg_meters = {'loss': AverageMeter(),
                   'iou': AverageMeter(),
-                   'dice': AverageMeter()}
+                  'dice': AverageMeter(),
+                  'boundary_loss': AverageMeter()} 
 
     # switch to evaluate mode
     model.eval()
@@ -192,24 +261,33 @@ def validate(config, val_loader, model, criterion):
             target = target.cuda()
 
             # compute output
-            if config['deep_supervision']:
+            if config.get('deep_supervision', False):
                 outputs = model(input)
                 loss = 0
+                boundary_loss_value = 0
                 for output in outputs:
                     loss += criterion(output, target)
+                    boundary_loss_value += boundary_loss(output, target)  
                 loss /= len(outputs)
+                boundary_loss_value /= len(outputs)
                 iou, dice, _ = iou_score(outputs[-1], target)
             else:
                 output = model(input)
                 loss = criterion(output, target)
+                boundary_loss_value = boundary_loss(output, target)  
                 iou, dice, _ = iou_score(output, target)
 
-            avg_meters['loss'].update(loss.item(), input.size(0))
+            total_loss = loss + boundary_loss_value
+            #total_loss = loss
+
+            avg_meters['loss'].update(total_loss.item(), input.size(0))
+            avg_meters['boundary_loss'].update(boundary_loss_value.item(), input.size(0))
             avg_meters['iou'].update(iou, input.size(0))
             avg_meters['dice'].update(dice, input.size(0))
 
             postfix = OrderedDict([
                 ('loss', avg_meters['loss'].avg),
+                ('boundary_loss', avg_meters['boundary_loss'].avg),
                 ('iou', avg_meters['iou'].avg),
                 ('dice', avg_meters['dice'].avg)
             ])
@@ -217,10 +295,12 @@ def validate(config, val_loader, model, criterion):
             pbar.update(1)
         pbar.close()
 
-
-    return OrderedDict([('loss', avg_meters['loss'].avg),
-                        ('iou', avg_meters['iou'].avg),
-                        ('dice', avg_meters['dice'].avg)])
+    return OrderedDict([
+        ('loss', avg_meters['loss'].avg),
+        ('boundary_loss', avg_meters['boundary_loss'].avg),
+        ('iou', avg_meters['iou'].avg),
+        ('dice', avg_meters['dice'].avg)
+    ])
 
 def seed_torch(seed=1029):
     random.seed(seed)
@@ -231,7 +311,6 @@ def seed_torch(seed=1029):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-
 
 def main():
     seed_torch()
@@ -257,45 +336,30 @@ def main():
 
     with open(f'{output_dir}/{exp_name}/config.yml', 'w') as f:
         yaml.dump(config, f)
-
-    # define loss function (criterion)
+        
     if config['loss'] == 'BCEWithLogitsLoss':
         criterion = nn.BCEWithLogitsLoss().cuda()
     else:
         criterion = losses.__dict__[config['loss']]().cuda()
 
+    boundary_loss = BoundaryLoss().cuda()
+
     cudnn.benchmark = True
 
     # create model
-   
-    model = BMFSegNet(in_chans=3,out_chans=1,depths=[2,2,2,2],feat_size=[48, 96, 192, 384])
+    model = BMFSegNet(in_chans=3, out_chans=1, depths=[2,2,2,2], feat_size=[48, 96, 192, 384])
     model = model.cuda()
+    param_groups = [{'params': param, 'lr': config['lr'], 'weight_decay': config['weight_decay']} for param in model.parameters()]
 
-    params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'Params:{params / 1e6:.2f}M')
-    param_groups = []
-
-    kan_fc_params = []
-    other_params = []
-
-    for name, param in model.named_parameters():
-        # print(name, "=>", param.shape)
-        if 'layer' in name.lower() and 'fc' in name.lower():
-            param_groups.append({'params': param, 'lr': config['lr'], 'weight_decay': config['weight_decay']})  
-        
-    # st()
     if config['optimizer'] == 'Adam':
         optimizer = optim.Adam(param_groups)
-
-
-    elif config['optimizer'] == 'SGD':
-        optimizer = optim.SGD(params, lr=config['lr'], momentum=config['momentum'], nesterov=config['nesterov'], weight_decay=config['weight_decay'])
+    elif config['optimizer'] == 'RMSprop':
+        optimizer = optim.RMSprop(param_groups)
     else:
         raise NotImplementedError
 
     if config['scheduler'] == 'CosineAnnealingLR':
-        scheduler = lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=config['epochs'], eta_min=config['min_lr'])
+        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'], eta_min=config['min_lr'])
     elif config['scheduler'] == 'ReduceLROnPlateau':
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, factor=config['factor'], patience=config['patience'], verbose=1, min_lr=config['min_lr'])
     elif config['scheduler'] == 'MultiStepLR':
@@ -304,26 +368,24 @@ def main():
         scheduler = None
     else:
         raise NotImplementedError
-
-    
-
     dataset_name = config['dataset']
     img_ext = '.png'
 
-    if dataset_name == 'BUSI':
+    if dataset_name == 'busi-1':
         mask_ext = '_mask.png'
-    elif dataset_name == 'PH2':
+    elif dataset_name == 'Dataset001_COVID-19':
         mask_ext = '.png'
     elif dataset_name == 'BUS':
         mask_ext = '.png'
-           
-    # Data loading code
+    elif dataset_name == 'PH2':
+        mask_ext = '.png'
+   
     img_ids = sorted(glob(os.path.join(config['data_dir'], config['dataset'], 'images', '*' + img_ext)))
     img_ids = [os.path.splitext(os.path.basename(p))[0] for p in img_ids]
 
-    data = '.../inputs/BUS/images'
+    data = '……/BUS/images'
     train_img_ids, val_img_ids, test_img_ids = get_train_val_test_indices(data)
-    
+
     train_transform = Compose([
         RandomRotate90(),
         geometric.transforms.Flip(),
@@ -353,86 +415,32 @@ def main():
         num_classes=config['num_classes'],
         transform=val_transform)
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=config['num_workers'],
-        drop_last=True)
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        num_workers=config['num_workers'],
-        drop_last=False)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'], drop_last=True)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'], drop_last=False)
 
-    log = OrderedDict([
-        ('epoch', []),
-        ('lr', []),
-        ('loss', []),
-        ('iou', []),
-        ('val_loss', []),
-        ('val_iou', []),
-        ('val_dice', []),
-    ])
+    log = OrderedDict([('epoch', []), ('lr', []), ('loss', []), ('boundary_loss', []), ('iou', []), ('val_loss', []), ('val_iou', [])])
 
-   
     best_iou = 0
-    best_dice= 0
-    trigger = 0
     for epoch in range(config['epochs']):
         print('Epoch [%d/%d]' % (epoch, config['epochs']))
 
-        # train for one epoch
-        train_log = train(config, train_loader, model, criterion, optimizer)
-        # evaluate on validation set
-        val_log = validate(config, val_loader, model, criterion)
+        train_log = train(config, train_loader, model, criterion, boundary_loss, optimizer)
+        val_log = validate(config, val_loader, model, criterion, boundary_loss)
 
         if config['scheduler'] == 'CosineAnnealingLR':
             scheduler.step()
         elif config['scheduler'] == 'ReduceLROnPlateau':
             scheduler.step(val_log['loss'])
 
-        print('loss %.4f - iou %.4f - val_loss %.4f - val_iou %.4f'
-              % (train_log['loss'], train_log['iou'], val_log['loss'], val_log['iou']))
+        print('loss %.4f - boundary_loss %.4f - iou %.4f - val_loss %.4f - val_iou %.4f'
+              % (train_log['loss'], train_log['boundary_loss'], train_log['iou'], val_log['loss'], val_log['iou']))
 
-        log['epoch'].append(epoch)
-        log['lr'].append(config['lr'])
-        log['loss'].append(train_log['loss'])
-        log['iou'].append(train_log['iou'])
-        log['val_loss'].append(val_log['loss'])
-        log['val_iou'].append(val_log['iou'])
-        log['val_dice'].append(val_log['dice'])
-
-        pd.DataFrame(log).to_csv(f'{output_dir}/{exp_name}/log.csv', index=False)
-
-        my_writer.add_scalar('train/loss', train_log['loss'], global_step=epoch)
-        my_writer.add_scalar('train/iou', train_log['iou'], global_step=epoch)
-        my_writer.add_scalar('val/loss', val_log['loss'], global_step=epoch)
-        my_writer.add_scalar('val/iou', val_log['iou'], global_step=epoch)
-        my_writer.add_scalar('val/dice', val_log['dice'], global_step=epoch)
-
-        my_writer.add_scalar('val/best_iou_value', best_iou, global_step=epoch)
-        my_writer.add_scalar('val/best_dice_value', best_dice, global_step=epoch)
-
-        trigger += 1
-
-        if val_log['dice'] > best_dice:
+        if val_log['iou'] > best_iou:
             torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model.pth')
             best_iou = val_log['iou']
-            best_dice = val_log['dice']
             print("=> saved best model")
-            print('IoU: %.4f' % best_iou)
-            print('Dice: %.4f' % best_dice)
-            trigger = 0
-       
 
-        # early stopping
-        if config['early_stopping'] >= 0 and trigger >= config['early_stopping']:
-            print("=> early stopping")
-            break
-        
         torch.cuda.empty_cache()
     
 if __name__ == '__main__':
-    main() 
+    main()
